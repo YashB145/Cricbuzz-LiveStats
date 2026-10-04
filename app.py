@@ -546,17 +546,389 @@ INTERNATIONAL_PLAYERS_DATA = {
     }
 }
 
+def get_rapidapi_key():
+    try:
+        if "RAPIDAPI_KEY" in st.secrets:
+            return st.secrets["RAPIDAPI_KEY"]
+    except Exception:
+        pass
+
+    return os.getenv("RAPIDAPI_KEY", "")
+
+# ---------------- API RELIABILITY & CIRCUIT BREAKER ----------------
+_API_QUOTA_EXHAUSTED = False
+
+def is_api_quota_exhausted():
+    global _API_QUOTA_EXHAUSTED
+    return _API_QUOTA_EXHAUSTED
+
+def record_api_quota_exhausted():
+    global _API_QUOTA_EXHAUSTED
+    _API_QUOTA_EXHAUSTED = True
+
+def reset_api_quota_exhausted():
+    global _API_QUOTA_EXHAUSTED
+    _API_QUOTA_EXHAUSTED = False
+
+# ---------------- DYNAMIC PLAYER PIPELINE & CACHE ----------------
+_PLAYER_CACHE = {}
+_MATCH_SQUAD_CACHE = {}
+
+def safe_int(v, default=0):
+    try:
+        if v is None:
+            return default
+        cleaned = re.sub(r"[^\d]", "", str(v))
+        return int(cleaned) if cleaned else default
+    except Exception:
+        return default
+
+def safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        cleaned = re.sub(r"[^\d.]", "", str(v))
+        return round(float(cleaned), 2) if cleaned else default
+    except Exception:
+        return default
+
+def parse_career_tables(career_data):
+    """Parse Cricbuzz career tables into standard format dicts for batting and bowling."""
+    batting = {
+        "Test": {"matches": 0, "innings": 0, "runs": 0, "highest": "-", "average": 0.0, "strike_rate": 0.0, "100s": 0, "50s": 0},
+        "ODI": {"matches": 0, "innings": 0, "runs": 0, "highest": "-", "average": 0.0, "strike_rate": 0.0, "100s": 0, "50s": 0},
+        "T20I": {"matches": 0, "innings": 0, "runs": 0, "highest": "-", "average": 0.0, "strike_rate": 0.0, "100s": 0, "50s": 0},
+    }
+    bowling = {
+        "Test": {"wickets": 0, "best": "-", "average": 0.0, "economy": 0.0},
+        "ODI": {"wickets": 0, "best": "-", "average": 0.0, "economy": 0.0},
+        "T20I": {"wickets": 0, "best": "-", "average": 0.0, "economy": 0.0},
+    }
+    if not career_data or not isinstance(career_data, dict):
+        return batting, bowling
+
+    fmt_map = {"test": "Test", "odi": "ODI", "t20i": "T20I", "t20": "T20I"}
+
+    # Pattern 1: Cricbuzz values blocks (Batting / Bowling tables)
+    for block in career_data.get("values", []):
+        if not isinstance(block, dict):
+            continue
+        name = str(block.get("name", "")).lower()
+        rows = block.get("values", [])
+        if "bat" in name:
+            for row in rows:
+                cells = row.get("values", []) if isinstance(row, dict) else row
+                if isinstance(cells, list) and len(cells) >= 2:
+                    raw_fmt = str(cells[0]).strip().lower()
+                    fmt = fmt_map.get(raw_fmt)
+                    if fmt and fmt in batting:
+                        if len(cells) >= 4:
+                            batting[fmt]["matches"] = safe_int(cells[1])
+                            batting[fmt]["innings"] = safe_int(cells[2])
+                            batting[fmt]["runs"] = safe_int(cells[3])
+                        if len(cells) >= 5:
+                            batting[fmt]["highest"] = str(cells[4]).strip()
+                        if len(cells) >= 6:
+                            batting[fmt]["average"] = safe_float(cells[5])
+                        if len(cells) >= 7:
+                            batting[fmt]["strike_rate"] = safe_float(cells[6])
+                        if len(cells) >= 8:
+                            batting[fmt]["100s"] = safe_int(cells[7])
+                        if len(cells) >= 9:
+                            batting[fmt]["50s"] = safe_int(cells[8])
+        elif "bowl" in name:
+            for row in rows:
+                cells = row.get("values", []) if isinstance(row, dict) else row
+                if isinstance(cells, list) and len(cells) >= 2:
+                    raw_fmt = str(cells[0]).strip().lower()
+                    fmt = fmt_map.get(raw_fmt)
+                    if fmt and fmt in bowling:
+                        if len(cells) >= 5:
+                            bowling[fmt]["wickets"] = safe_int(cells[4] if len(cells) >= 5 else cells[1])
+                        if len(cells) >= 6:
+                            bowling[fmt]["best"] = str(cells[5]).strip()
+                        if len(cells) >= 7:
+                            bowling[fmt]["average"] = safe_float(cells[6])
+                        if len(cells) >= 8:
+                            bowling[fmt]["economy"] = safe_float(cells[7])
+
+    # Pattern 2: Dictionary format
+    if "batting" in career_data and isinstance(career_data["batting"], dict):
+        for k, v in career_data["batting"].items():
+            fmt = fmt_map.get(str(k).lower())
+            if fmt and isinstance(v, dict):
+                batting[fmt]["matches"] = safe_int(v.get("matches") or v.get("m"))
+                batting[fmt]["innings"] = safe_int(v.get("innings") or v.get("inn"))
+                batting[fmt]["runs"] = safe_int(v.get("runs") or v.get("r"))
+                batting[fmt]["highest"] = str(v.get("highest") or v.get("hs") or "-")
+                batting[fmt]["average"] = safe_float(v.get("average") or v.get("avg"))
+                batting[fmt]["strike_rate"] = safe_float(v.get("strike_rate") or v.get("sr"))
+                batting[fmt]["100s"] = safe_int(v.get("100s") or v.get("hundreds"))
+                batting[fmt]["50s"] = safe_int(v.get("50s") or v.get("fifties"))
+
+    if "bowling" in career_data and isinstance(career_data["bowling"], dict):
+        for k, v in career_data["bowling"].items():
+            fmt = fmt_map.get(str(k).lower())
+            if fmt and isinstance(v, dict):
+                bowling[fmt]["wickets"] = safe_int(v.get("wickets") or v.get("w"))
+                bowling[fmt]["best"] = str(v.get("best") or v.get("bbi") or "-")
+                bowling[fmt]["average"] = safe_float(v.get("average") or v.get("avg"))
+                bowling[fmt]["economy"] = safe_float(v.get("economy") or v.get("eco"))
+
+    return batting, bowling
+
+def fetch_match_squad(match_id):
+    """Dynamically obtain match squad / playing XI from Cricbuzz RapidAPI.
+    
+    API Match → Team → Squad/Playing XI → Players
+    """
+    if not match_id or is_api_quota_exhausted():
+        return None
+    match_id_str = str(match_id)
+    if match_id_str in _MATCH_SQUAD_CACHE:
+        return _MATCH_SQUAD_CACHE[match_id_str]
+
+    api_key = get_rapidapi_key()
+    if not api_key:
+        return None
+
+    url = f"https://cricbuzz-cricket.p.rapidapi.com/mcenter/v1/{match_id}/squads"
+    headers = {
+        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code == 429:
+            record_api_quota_exhausted()
+            return {"quota_exceeded": True}
+        if resp.status_code == 200:
+            res_json = resp.json()
+            _MATCH_SQUAD_CACHE[match_id_str] = res_json
+            return res_json
+    except Exception:
+        pass
+
+    # Fallback to scorecard endpoint for playing players
+    try:
+        scard_url = f"https://cricbuzz-cricket.p.rapidapi.com/mcenter/v1/{match_id}/scard"
+        resp = requests.get(scard_url, headers=headers, timeout=12)
+        if resp.status_code == 429:
+            record_api_quota_exhausted()
+            return {"quota_exceeded": True}
+        if resp.status_code == 200:
+            res_json = resp.json()
+            _MATCH_SQUAD_CACHE[match_id_str] = res_json
+            return res_json
+    except Exception:
+        pass
+    return None
+
+def parse_squad_players(squad_data):
+    """Extract list of player dictionaries from Cricbuzz squad / scorecard JSON."""
+    if not squad_data or not isinstance(squad_data, dict):
+        return []
+
+    players = []
+    seen_ids = set()
+
+    def add_player(p_id, p_name, team_name="", role="Player", is_playing=True, image_id=None):
+        if not p_id or not p_name or p_id in seen_ids:
+            return
+        seen_ids.add(p_id)
+        players.append({
+            "id": str(p_id),
+            "name": str(p_name).strip(),
+            "team_name": team_name,
+            "role": role or "Player",
+            "is_playing": is_playing,
+            "image": f"https://static.cricbuzz.com/a/img/v1/i1/c{image_id}/i.jpg" if image_id else None
+        })
+
+    # Pattern 1: {"team1": {"name": ..., "squad": [...]}, "team2": {...}}
+    for t_key in ["team1", "team2"]:
+        t_obj = squad_data.get(t_key)
+        if isinstance(t_obj, dict):
+            t_name = t_obj.get("name", "")
+            for p in t_obj.get("squad", []) or t_obj.get("players", []):
+                if isinstance(p, dict):
+                    add_player(
+                        p.get("id"),
+                        p.get("name") or p.get("fullName"),
+                        team_name=t_name,
+                        role=p.get("role", "Player"),
+                        is_playing=p.get("playingXI", True),
+                        image_id=p.get("faceImageId") or p.get("imageId")
+                    )
+
+    # Pattern 2: {"players": {"team1": {"playingXI": [...], "bench": [...]}}}
+    players_wrapper = squad_data.get("players")
+    if isinstance(players_wrapper, dict):
+        for t_key in ["team1", "team2"]:
+            t_data = players_wrapper.get(t_key)
+            if isinstance(t_data, dict):
+                t_name = t_data.get("name", "")
+                for p in t_data.get("playingXI", []):
+                    if isinstance(p, dict):
+                        add_player(p.get("id"), p.get("name"), t_name, p.get("role", "Player"), True, p.get("faceImageId"))
+                for p in t_data.get("bench", []):
+                    if isinstance(p, dict):
+                        add_player(p.get("id"), p.get("name"), t_name, p.get("role", "Player"), False, p.get("faceImageId"))
+
+    # Pattern 3: Scorecard fallback {"scoreCard": [{"batTeamDetails": ..., "bowlTeamDetails": ...}]}
+    score_cards = squad_data.get("scoreCard", [])
+    if isinstance(score_cards, list):
+        for sc in score_cards:
+            if isinstance(sc, dict):
+                bat_team = sc.get("batTeamDetails", {})
+                t_name = bat_team.get("batTeamName", "")
+                batsmen_data = bat_team.get("batsmenData", {})
+                if isinstance(batsmen_data, dict):
+                    for b_id, b_info in batsmen_data.items():
+                        if isinstance(b_info, dict):
+                            add_player(b_info.get("batId"), b_info.get("batName"), t_name, "Batsman", True)
+                bowl_team = sc.get("bowlTeamDetails", {})
+                bowl_t_name = bowl_team.get("bowlTeamName", "")
+                bowlers_data = bowl_team.get("bowlersData", {})
+                if isinstance(bowlers_data, dict):
+                    for b_id, b_info in bowlers_data.items():
+                        if isinstance(b_info, dict):
+                            add_player(b_info.get("bowlerId"), b_info.get("bowlName"), bowl_t_name, "Bowler", True)
+
+    return players
+
+def fetch_api_player_profile(player_id):
+    """Fetch verified player bio and profile info from Cricbuzz RapidAPI."""
+    if not player_id or is_api_quota_exhausted():
+        return None
+    api_key = get_rapidapi_key()
+    if not api_key:
+        return None
+    url = f"https://cricbuzz-cricket.p.rapidapi.com/stats/v1/player/{player_id}"
+    headers = {
+        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 429:
+            record_api_quota_exhausted()
+            return {"quota_exceeded": True}
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+def fetch_api_player_career(player_id):
+    """Fetch verified career batting and bowling figures from Cricbuzz RapidAPI."""
+    if not player_id or is_api_quota_exhausted():
+        return None
+    api_key = get_rapidapi_key()
+    if not api_key:
+        return None
+    url = f"https://cricbuzz-cricket.p.rapidapi.com/stats/v1/player/{player_id}/career"
+    headers = {
+        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 429:
+            record_api_quota_exhausted()
+            return {"quota_exceeded": True}
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+def build_dynamic_player_stats(player_id, player_name, gender_hint="Men's"):
+    """Fetch profile and career stats for a player and cache the structured record."""
+    if not player_id:
+        return None
+
+    profile_data = fetch_api_player_profile(player_id) or {}
+    if isinstance(profile_data, dict) and profile_data.get("quota_exceeded"):
+        return {"error": "Cricbuzz API quota exceeded.", "quota_exceeded": True}
+
+    career_data = fetch_api_player_career(player_id) or {}
+    if isinstance(career_data, dict) and career_data.get("quota_exceeded"):
+        return {"error": "Cricbuzz API quota exceeded.", "quota_exceeded": True}
+
+    batting, bowling = parse_career_tables(career_data)
+
+    name = profile_data.get("name") or player_name
+    country = profile_data.get("intlTeam") or profile_data.get("country") or "International"
+    role = profile_data.get("role") or "All-rounder"
+    image_id = profile_data.get("imageId") or profile_data.get("faceImageId")
+    img_url = f"https://static.cricbuzz.com/a/img/v1/i1/c{image_id}/i.jpg" if image_id else None
+    teams_raw = profile_data.get("teams", "")
+    teams_list = [t.strip() for t in str(teams_raw).split(",") if t.strip()] if teams_raw else [country]
+
+    player_record = {
+        "id": str(player_id),
+        "name": name,
+        "gender": gender_hint,
+        "country": country,
+        "role": role,
+        "teams": teams_list,
+        "image": img_url,
+        "batting_career": batting,
+        "bowling_career": bowling,
+        "is_api_driven": True
+    }
+
+    _PLAYER_CACHE[name] = player_record
+    _PLAYER_CACHE[str(player_id)] = player_record
+    return player_record
+
+def normalize_team_for_ml(team_name):
+    """Controlled team name mapping layer between API team names and historical Cricsheet ML dataset.
+    Preserves ML model compatibility without altering historical training data.
+    """
+    if not team_name:
+        return ""
+    clean = str(team_name).strip()
+    clean = re.sub(r"\s+Women('s)?$", "", clean, flags=re.IGNORECASE).strip()
+
+    API_TO_CRICSHEET_MAP = {
+        "USA": "United States of America",
+        "U.S.A.": "United States of America",
+        "United States": "United States of America",
+        "UAE": "United Arab Emirates",
+        "U.A.E.": "United Arab Emirates",
+        "PNG": "Papua New Guinea",
+        "P.N.G.": "Papua New Guinea",
+        "Hong Kong, China": "Hong Kong",
+        "Korea": "South Korea",
+        "Czechia": "Czech Republic",
+    }
+    return API_TO_CRICSHEET_MAP.get(clean, clean)
+
 def get_player_stats(player_name):
-    """Retrieve verified international player profile and career stats."""
+    """Retrieve verified international player profile and career stats.
+    Checks reference roster first, then dynamic API player cache."""
+    if not player_name:
+        return {"error": "Player name must not be empty."}
     player = INTERNATIONAL_PLAYERS_DATA.get(player_name)
-    if not player:
-        return {"error": f"Player '{player_name}' not found in international roster."}
-    return player
+    if player:
+        return player
+    if player_name in _PLAYER_CACHE:
+        return _PLAYER_CACHE[player_name]
+    return {"error": f"Player '{player_name}' not found in international roster."}
 
 def get_filtered_players(gender="All", country="All", role="All", search_term=""):
-    """Filter real international players by gender, country, role, and search term."""
+    """Filter real international players by gender, country, role, and search term.
+    Includes reference players and any dynamically discovered API players."""
     results = []
-    for name, data in INTERNATIONAL_PLAYERS_DATA.items():
+    combined_roster = dict(INTERNATIONAL_PLAYERS_DATA)
+    for p_key, p_data in _PLAYER_CACHE.items():
+        p_name = p_data.get("name")
+        if p_name and p_name not in combined_roster:
+            combined_roster[p_name] = p_data
+
+    for name, data in combined_roster.items():
         if gender != "All" and data.get("gender") != gender:
             continue
         if country != "All" and data.get("country") != country:
@@ -587,6 +959,7 @@ def search_api_player(player_name):
     try:
         resp = requests.get(url, headers=headers, params={"plrN": player_name}, timeout=10)
         if resp.status_code == 429:
+            record_api_quota_exhausted()
             return {"quota_exceeded": True}
         if resp.status_code == 200:
             data = resp.json()
@@ -594,6 +967,7 @@ def search_api_player(player_name):
     except Exception:
         pass
     return None
+
 
 st.set_page_config(
     page_title="Cricbuzz LiveStats",
@@ -613,15 +987,6 @@ def navigate_page(page):
 def load_ml_model_bundle():
     return get_model_bundle()
 
-
-def get_rapidapi_key():
-    try:
-        if "RAPIDAPI_KEY" in st.secrets:
-            return st.secrets["RAPIDAPI_KEY"]
-    except Exception:
-        pass
-
-    return os.getenv("RAPIDAPI_KEY", "")
 
 
 def apply_chart_theme(fig, height=400):
@@ -895,6 +1260,9 @@ def format_score_str(inngs):
 
 def fetch_api_matches(endpoint="live"):
     """Fetch live, upcoming, or recent matches from Cricbuzz RapidAPI if key is available."""
+    if is_api_quota_exhausted():
+        return []
+
     url = f"https://cricbuzz-cricket.p.rapidapi.com/matches/v1/{endpoint}"
     api_key = get_rapidapi_key()
 
@@ -908,6 +1276,9 @@ def fetch_api_matches(endpoint="live"):
 
     try:
         response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code == 429:
+            record_api_quota_exhausted()
+            return []
         response.raise_for_status()
         data = response.json()
         matches = []
@@ -922,8 +1293,26 @@ def fetch_api_matches(endpoint="live"):
                     info = match.get("matchInfo", {})
                     score = match.get("matchScore", {})
 
-                    team1 = info.get("team1", {}).get("teamName", "")
-                    team2 = info.get("team2", {}).get("teamName", "")
+                    t1_info = info.get("team1", {})
+                    t2_info = info.get("team2", {})
+
+                    team1 = t1_info.get("teamName", "")
+                    team2 = t2_info.get("teamName", "")
+                    team1_id = str(t1_info.get("teamId")) if t1_info.get("teamId") else None
+                    team2_id = str(t2_info.get("teamId")) if t2_info.get("teamId") else None
+                    team1_sname = t1_info.get("teamSName", "")
+                    team2_sname = t2_info.get("teamSName", "")
+                    t1_img = t1_info.get("imageId")
+                    t2_img = t2_info.get("imageId")
+                    team1_logo = f"https://static.cricbuzz.com/a/img/v1/i1/c{t1_img}/i.jpg" if t1_img else ""
+                    team2_logo = f"https://static.cricbuzz.com/a/img/v1/i1/c{t2_img}/i.jpg" if t2_img else ""
+
+                    match_id = str(info.get("matchId")) if info.get("matchId") else None
+                    series_id = str(info.get("seriesId")) if info.get("seriesId") else None
+
+                    team1_country = get_core_country(team1)
+                    team2_country = get_core_country(team2)
+
                     status = info.get("status", "")
                     state = info.get("state", "").lower()
                     match_format = info.get("matchFormat", "T20I")
@@ -959,8 +1348,18 @@ def fetch_api_matches(endpoint="live"):
                         stage = "Upcoming"
 
                     matches.append({
+                        "match_id": match_id,
+                        "series_id": series_id,
                         "team1": team1,
                         "team2": team2,
+                        "team1_id": team1_id,
+                        "team2_id": team2_id,
+                        "team1_sname": team1_sname,
+                        "team2_sname": team2_sname,
+                        "team1_logo": team1_logo,
+                        "team2_logo": team2_logo,
+                        "team1_country": team1_country,
+                        "team2_country": team2_country,
                         "team1_flag": get_team_flag(team1),
                         "team2_flag": get_team_flag(team2),
                         "status": status,
@@ -987,6 +1386,37 @@ def fetch_api_matches(endpoint="live"):
         # Re-raise so fetch_api_matches_with_status can detect the failure and
         # correctly report api_available=False (covers 429, network errors, etc.)
         raise
+
+def get_current_api_teams():
+    """Extract dynamic current teams directly from API fixtures (live, upcoming, recent).
+    Preserves API team ID, real team name, short name, logo, country, gender, and type."""
+    teams_dict = {}
+    for ep in ["live", "upcoming", "recent"]:
+        try:
+            matches = fetch_api_matches(ep)
+        except Exception:
+            matches = []
+        for m in matches:
+            for prefix in ["team1", "team2"]:
+                t_name = m.get(prefix)
+                t_id = m.get(f"{prefix}_id")
+                if not t_name:
+                    continue
+                key = str(t_id) if t_id else t_name
+                if key not in teams_dict:
+                    teams_dict[key] = {
+                        "id": t_id,
+                        "name": t_name,
+                        "short_name": m.get(f"{prefix}_sname", ""),
+                        "logo": m.get(f"{prefix}_logo", ""),
+                        "country": m.get(f"{prefix}_country", get_core_country(t_name)),
+                        "is_international": m.get("is_international", False),
+                        "is_franchise": m.get("is_franchise", False),
+                        "gender": m.get("gender", "Men's"),
+                        "flag": m.get(f"{prefix}_flag", get_team_flag(t_name))
+                    }
+    return list(teams_dict.values())
+
 
 def get_real_db_international_matches(limit=40, gender_filter=None):
     """Retrieve verified real international matches from cricket.db ml_international_matches."""
@@ -1194,13 +1624,18 @@ def fetch_api_matches_with_status(endpoint="live"):
     api_key = get_rapidapi_key()
     if not api_key:
         return [], False
+    if is_api_quota_exhausted():
+        return [], False
     try:
         results = fetch_api_matches(endpoint)
+        if is_api_quota_exhausted():
+            return [], False
         # Clean API response — 0 matches is a valid empty state (api_available=True)
         return results, True
     except Exception:
         # Any error (429 quota, timeout, parse failure) → treat API as unavailable
         return [], False
+
 
 
 def get_matches(endpoint="live"):
@@ -2199,7 +2634,8 @@ elif st.session_state.page == "live":
             else:
                 st.info("No international matches match the selected filter.")
         else:
-            for match in sorted_intl:
+            for idx, match in enumerate(sorted_intl):
+                match_id = match.get("match_id")
                 is_india = "India" in match.get("team1", "") or "India" in match.get("team2", "")
                 gender = match.get("gender", "Men's")
                 stage = match.get("stage", "Live")
@@ -2216,6 +2652,10 @@ elif st.session_state.page == "live":
                 t2_flag = match.get("team2_flag", "🏏")
                 t1_name = match.get("team1", "")
                 t2_name = match.get("team2", "")
+                t1_sname = match.get("team1_sname")
+                t2_sname = match.get("team2_sname")
+                t1_display = f"{t1_name} ({t1_sname})" if t1_sname and t1_sname != t1_name else t1_name
+                t2_display = f"{t2_name} ({t2_sname})" if t2_sname and t2_sname != t2_name else t2_name
 
                 score1_str = match.get("score1", "")
                 score2_str = match.get("score2", "")
@@ -2249,12 +2689,12 @@ elif st.session_state.page == "live":
                     </div>
                     <div style="display: flex; justify-content: space-between; align-items: center; margin: 12px 0; flex-wrap: wrap;">
                         <div style="font-size: 18px; font-weight: 700; color: #f8fafc;">
-                            <span style="font-size: 24px; margin-right: 6px;">{t1_flag}</span> {t1_name}
+                            <span style="font-size: 24px; margin-right: 6px;">{t1_flag}</span> {t1_display}
                             <span style="color: #38bdf8; margin-left: 10px; font-size: 19px;">{score1_str}</span>
                         </div>
                         <div style="color: #64748b; font-weight: 700; font-size: 14px; padding: 0 12px;">VS</div>
                         <div style="font-size: 18px; font-weight: 700; color: #f8fafc;">
-                            <span style="font-size: 24px; margin-right: 6px;">{t2_flag}</span> {t2_name}
+                            <span style="font-size: 24px; margin-right: 6px;">{t2_flag}</span> {t2_display}
                             <span style="color: #38bdf8; margin-left: 10px; font-size: 19px;">{score2_str}</span>
                         </div>
                     </div>
@@ -2267,6 +2707,61 @@ elif st.session_state.page == "live":
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+                m_actions_c1, m_actions_c2 = st.columns([1, 1])
+                with m_actions_c1:
+                    with st.expander(f"👥 Squad & Playing XI ({t1_name} vs {t2_name})"):
+                        if not match_id:
+                            st.info("ℹ️ Match squad stream is available for verified live matches with an API match ID.")
+                        else:
+                            squad_raw = fetch_match_squad(match_id)
+                            if isinstance(squad_raw, dict) and squad_raw.get("quota_exceeded"):
+                                st.warning("⚠️ Cricbuzz API quota reached. Squad details cannot be refreshed at this time.")
+                            elif squad_raw:
+                                squad_players = parse_squad_players(squad_raw)
+                                if squad_players:
+                                    t1_players = [p for p in squad_players if t1_name.lower() in p.get("team_name", "").lower() or not p.get("team_name")]
+                                    t2_players = [p for p in squad_players if t2_name.lower() in p.get("team_name", "").lower()]
+                                    if not t2_players and len(squad_players) > 1:
+                                        mid = len(squad_players) // 2
+                                        t1_players = squad_players[:mid]
+                                        t2_players = squad_players[mid:]
+
+                                    sq_c1, sq_c2 = st.columns(2)
+                                    with sq_c1:
+                                        st.markdown(f"**{t1_name}**")
+                                        for p in t1_players:
+                                            p_role = p.get("role", "Player")
+                                            p_badge = "🟢 XI" if p.get("is_playing") else "⚪ Bench"
+                                            st.caption(f"{p_badge} **{p.get('name')}** ({p_role})")
+                                    with sq_c2:
+                                        st.markdown(f"**{t2_name}**")
+                                        for p in t2_players:
+                                            p_role = p.get("role", "Player")
+                                            p_badge = "🟢 XI" if p.get("is_playing") else "⚪ Bench"
+                                            st.caption(f"{p_badge} **{p.get('name')}** ({p_role})")
+                                else:
+                                    st.info("Squad announcement pending from match referee.")
+                            else:
+                                st.info("Squad stream pending or unavailable from match broadcaster.")
+
+                with m_actions_c2:
+                    if st.button("🔮 Predict Outcome with ML ➔", key=f"btn_live_ml_{idx}_{match_id if match_id else idx}"):
+                        norm_t1 = normalize_team_for_ml(t1_name)
+                        norm_t2 = normalize_team_for_ml(t2_name)
+                        ml_fmt = "T20"
+                        if "ODI" in fmt or "50" in fmt:
+                            ml_fmt = "ODI"
+                        elif "Test" in fmt:
+                            ml_fmt = "Test"
+                        st.session_state.ml_prefill = {
+                            "team1": norm_t1,
+                            "team2": norm_t2,
+                            "format": ml_fmt,
+                            "gender": gender if gender in ["Men's", "Women's"] else "Men's"
+                        }
+                        st.session_state.page = "ml"
+                        st.rerun()
 
     # ---------------- TAB 2: FRANCHISE LEAGUES (IPL / WPL / BBL) ----------------
     with tab_franchise:
@@ -2554,6 +3049,33 @@ elif st.session_state.page == "ml":
             } if genders else {}
             gender_display_opts = list(raw_gender_map.keys()) if raw_gender_map else ["Men's", "Women's"]
 
+            # Check for incoming prefill from Live Matches page
+            ml_prefill = st.session_state.pop("ml_prefill", None)
+            if ml_prefill:
+                p_t1 = ml_prefill.get("team1")
+                p_t2 = ml_prefill.get("team2")
+                p_fmt = ml_prefill.get("format")
+                p_gen = ml_prefill.get("gender")
+                if p_gen and p_gen in gender_display_opts:
+                    st.session_state["ml_gender"] = p_gen
+                if p_fmt and p_fmt in sorted(formats):
+                    st.session_state["ml_format"] = p_fmt
+                if p_t1 and p_t1 in teams:
+                    st.session_state["ml_team1"] = p_t1
+                if p_t2 and p_t2 in teams:
+                    st.session_state["ml_team2"] = p_t2
+
+            def _get_idx(lst, val, fallback=0):
+                try:
+                    return lst.index(val)
+                except (ValueError, TypeError):
+                    return fallback
+
+            idx_gen = _get_idx(gender_display_opts, st.session_state.get("ml_gender"), 0)
+            idx_fmt = _get_idx(sorted(formats), st.session_state.get("ml_format"), 0)
+            idx_t1 = _get_idx(teams, st.session_state.get("ml_team1"), 0)
+            idx_t2 = _get_idx(teams, st.session_state.get("ml_team2"), 1 if len(teams) > 1 else 0)
+
             # ─────────────────────────────────────────────────
             # PREDICTION FORM
             # ─────────────────────────────────────────────────
@@ -2563,22 +3085,21 @@ elif st.session_state.page == "ml":
 
             with form_c1:
                 gender_label = st.selectbox(
-                    "🚻 Gender", gender_display_opts, key="ml_gender"
+                    "🚻 Gender", gender_display_opts, index=idx_gen, key="ml_gender"
                 )
                 gender_db = raw_gender_map.get(gender_label, _GENDER_DB.get(gender_label, gender_label.lower()))
 
                 match_format = st.selectbox(
-                    "🏆 Format", sorted(formats), key="ml_format"
+                    "🏆 Format", sorted(formats), index=idx_fmt, key="ml_format"
                 )
 
             with form_c2:
-                team1 = st.selectbox("🏳️ Team 1", teams, key="ml_team1")
+                team1 = st.selectbox("🏳️ Team 1", teams, index=idx_t1, key="ml_team1")
 
             with form_c3:
-                default_t2_idx = 1 if len(teams) > 1 else 0
                 team2 = st.selectbox(
                     "🏳️ Team 2", teams,
-                    index=default_t2_idx,
+                    index=idx_t2,
                     key="ml_team2"
                 )
 
@@ -2790,10 +3311,13 @@ elif st.session_state.page == "players":
     if not matching_players:
         st.warning("⚠️ No international players found matching the selected filters. Try broadening your criteria.")
     else:
-        st.markdown(f"**Found {len(matching_players)} verified international players:**")
+        p_idx = 0
+        if "p_selected_player" in st.session_state and st.session_state["p_selected_player"] in matching_players:
+            p_idx = matching_players.index(st.session_state["p_selected_player"])
         selected_player = st.selectbox(
             "Select International Player",
             matching_players,
+            index=p_idx,
             key="p_selected_player"
         )
 
@@ -2805,6 +3329,8 @@ elif st.session_state.page == "players":
             p_role = player_data.get("role", "")
             p_teams = ", ".join(player_data.get("teams", []))
             p_flag = get_team_flag(p_country)
+            p_image = player_data.get("image")
+            p_avatar_html = f'<img src="{p_image}" style="width: 50px; height: 50px; border-radius: 50%; object-fit: cover; border: 2px solid #38bdf8; margin-right: 10px;" />' if p_image else f'<span style="font-size: 36px; margin-right: 8px;">{p_flag}</span>'
 
             gender_color = "#38bdf8" if p_gender == "Men's" else "#f472b6"
 
@@ -2813,8 +3339,8 @@ elif st.session_state.page == "players":
             <div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.95) 0%, rgba(15, 23, 42, 0.9) 100%); border: 2px solid rgba(56, 189, 248, 0.35); border-radius: 16px; padding: 22px 28px; margin: 18px 0; box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
                     <div>
-                        <div style="font-size: 32px; font-weight: 800; color: #f8fafc;">
-                            <span style="font-size: 36px; margin-right: 8px;">{p_flag}</span> {selected_player}
+                        <div style="font-size: 30px; font-weight: 800; color: #f8fafc; display: flex; align-items: center;">
+                            {p_avatar_html} {selected_player}
                         </div>
                         <div style="color: #94a3b8; font-size: 15px; margin-top: 6px;">
                             Representing: <strong style="color: #e2e8f0;">{p_country}</strong> | Teams: <span style="color: #cbd5e1;">{p_teams}</span>
@@ -2976,19 +3502,95 @@ elif st.session_state.page == "players":
                     if st.button("🔍 Search API", key="search_api_btn"):
                         with st.spinner("Querying Cricbuzz RapidAPI..."):
                             api_res = search_api_player(live_query)
-                            if isinstance(api_res, dict) and api_res.get("quota_exceeded"):
-                                st.warning(
-                                    "⚠️ **Cricbuzz API quota exceeded.** "
-                                    "Your RapidAPI monthly request limit has been reached. "
-                                    "The local player database above is still fully available. "
-                                    "Please try again after your quota resets (typically the 1st of next month)."
-                                )
-                            elif api_res:
-                                st.success(f"Found {len(api_res)} player matches from Cricbuzz API:")
-                                for plr in api_res:
-                                    st.write(f"• **{plr.get('name')}** (ID: {plr.get('id')}) - Team: {plr.get('teamName', 'N/A')}")
+                            st.session_state["api_player_search_results"] = api_res
+
+                    search_results = st.session_state.get("api_player_search_results")
+                    if isinstance(search_results, dict) and search_results.get("quota_exceeded"):
+                        st.warning(
+                            "⚠️ **Cricbuzz API quota exceeded.** "
+                            "Your RapidAPI monthly request limit has been reached. "
+                            "The local player database above is still fully available. "
+                            "Please try again after your quota resets (typically the 1st of next month)."
+                        )
+                    elif isinstance(search_results, list) and len(search_results) > 0:
+                        st.success(f"Found {len(search_results)} player matches from Cricbuzz API:")
+                        for p_idx, plr in enumerate(search_results):
+                            p_name = plr.get('name', 'Unknown')
+                            p_id = plr.get('id')
+                            p_team = plr.get('teamName', 'N/A')
+                            c_p1, c_p2 = st.columns([3, 2])
+                            with c_p1:
+                                st.markdown(f"🏏 **{p_name}** (ID: `{p_id}`) — Team: *{p_team}*")
+                            with c_p2:
+                                if st.button(f"📊 Load Career Profile", key=f"btn_load_api_plr_{p_idx}_{p_id}"):
+                                    with st.spinner(f"Loading full career profile for {p_name}..."):
+                                        rec = build_dynamic_player_stats(p_id, p_name)
+                                        if rec and not rec.get("quota_exceeded"):
+                                            st.session_state["p_selected_player"] = p_name
+                                            st.session_state["p_search_kw"] = ""
+                                            st.session_state["p_country_filter"] = "All"
+                                            st.session_state["p_role_filter"] = "All"
+                                            st.session_state["p_gender_filter"] = "All"
+                                            st.success(f"✅ Loaded {p_name} into player analytics!")
+                                            st.rerun()
+                                        elif rec and rec.get("quota_exceeded"):
+                                            st.warning("⚠️ Cricbuzz API quota reached while fetching player profile.")
+                                        else:
+                                            st.warning(f"Could not retrieve detailed career statistics for {p_name}.")
+                    elif search_results is not None:
+                        st.warning(f"No API results returned for '{live_query}'. Check the player name spelling or try another name.")
+
+                # Dynamic Match Squad Players Import Section (Task 3 Pipeline)
+                st.markdown("---")
+                st.subheader("👥 Import Players from Active Match Squads")
+                st.caption("Inspect live match squads and load any playing XI or squad player directly into Career Analytics.")
+
+                live_m, _ = get_live_matches()
+                upc_m, _ = get_upcoming_matches()
+                active_match_list = [m for m in (live_m + upc_m) if m.get("match_id")]
+
+                if not active_match_list:
+                    st.info("ℹ️ No active live/upcoming international matches with streamable squad IDs at this moment.")
+                else:
+                    match_opts = {
+                        f"{m.get('team1')} vs {m.get('team2')} ({m.get('format')} - {m.get('stage')})": m
+                        for m in active_match_list
+                    }
+                    sel_match_label = st.selectbox("Select Match to Inspect Squad", list(match_opts.keys()), key="squad_match_select")
+                    sel_match_obj = match_opts[sel_match_label]
+                    m_id = sel_match_obj.get("match_id")
+
+                    if m_id:
+                        squad_raw = fetch_match_squad(m_id)
+                        if isinstance(squad_raw, dict) and squad_raw.get("quota_exceeded"):
+                            st.warning("⚠️ Cricbuzz API quota reached. Squad details cannot be retrieved.")
+                        elif squad_raw:
+                            sq_players = parse_squad_players(squad_raw)
+                            if sq_players:
+                                sq_names = {f"{p.get('name')} ({p.get('role', 'Player')}) - {p.get('team_name', '')}": p for p in sq_players}
+                                sel_sq_label = st.selectbox("Select Player from Squad", list(sq_names.keys()), key="squad_player_select")
+                                sel_p_obj = sq_names[sel_sq_label]
+
+                                if st.button(f"📥 View {sel_p_obj.get('name')} Career Stats ➔", key="btn_import_squad_player"):
+                                    with st.spinner(f"Loading career profile for {sel_p_obj.get('name')}..."):
+                                        p_id = sel_p_obj.get("id")
+                                        p_name = sel_p_obj.get("name")
+                                        rec = build_dynamic_player_stats(p_id, p_name)
+                                        if rec and not rec.get("quota_exceeded"):
+                                            st.session_state["p_selected_player"] = p_name
+                                            st.session_state["p_search_kw"] = ""
+                                            st.session_state["p_country_filter"] = "All"
+                                            st.session_state["p_role_filter"] = "All"
+                                            st.session_state["p_gender_filter"] = "All"
+                                            st.rerun()
+                                        elif rec and rec.get("quota_exceeded"):
+                                            st.warning("⚠️ Cricbuzz API quota reached while fetching player profile.")
+                                        else:
+                                            st.warning(f"Could not retrieve detailed career statistics for {p_name}.")
                             else:
-                                st.warning(f"No API results returned for '{live_query}'. Check the player name spelling or try another name.")
+                                st.info("Squad stream pending from match referee.")
+                        else:
+                            st.info("Squad stream unavailable for this match.")
 
     st.markdown("---")
     st.button("⬅ Back to Home", key="back_players_bottom", on_click=navigate_page, args=("home",))
@@ -2996,12 +3598,15 @@ elif st.session_state.page == "players":
 # ================== CRUD OPERATIONS PAGE ==================
 elif st.session_state.page == "crud":
 
-    st.title("⚙️ CRUD Operations - Database Management")
-
-    st.markdown("""
-    ### Manage Match Records
-    Create, Read, Update, and Delete match records directly from your database.
-    """)
+    col_c_hdr1, col_c_hdr2 = st.columns([5, 2])
+    with col_c_hdr1:
+        st.title("⚙️ CRUD Operations - Database Management")
+        st.markdown("""
+        ### Manage Match Records
+        Create, Read, Update, and Delete match records directly from your database.
+        """)
+    with col_c_hdr2:
+        st.button("🏢 Relational Entities & Schema ➔", key="btn_nav_to_enhanced_db", on_click=navigate_page, args=("enhanced_db",))
 
     # CRUD Tabs
     crud_tab1, crud_tab2, crud_tab3, crud_tab4 = st.tabs(["➕ Create", "📖 Read", "✏️ Update", "🗑️ Delete"])
@@ -3206,7 +3811,11 @@ elif st.session_state.page == "crud":
         with col4:
             st.metric("Matches with Scores", stats['matches_with_scores'])
 
-    st.button("⬅ Back", key="back_crud", on_click=navigate_page, args=("home",))
+    col_cb1, col_cb2 = st.columns([1, 1])
+    with col_cb1:
+        st.button("⬅ Back to Home", key="back_crud", on_click=navigate_page, args=("home",))
+    with col_cb2:
+        st.button("🏢 Go to Enhanced Relational DB ➔", key="btn_crud_to_enhanced_bot", on_click=navigate_page, args=("enhanced_db",))
 
 # ================== ENHANCED DATABASE MANAGEMENT PAGE ==================
 elif st.session_state.page == "enhanced_db":
@@ -3215,7 +3824,7 @@ elif st.session_state.page == "enhanced_db":
 
     st.markdown("""
     ### Advanced Database Operations
-    Manage teams, venues, players, and enhanced match records with proper relationships.
+    Manage teams, venues, players, and enhanced match records with proper relational schemas.
     """)
 
     # Enhanced DB Tabs
@@ -3237,7 +3846,7 @@ elif st.session_state.page == "enhanced_db":
             team_captain = st.text_input("Captain", key="team_captain")
             team_coach = st.text_input("Coach", key="team_coach")
 
-            if st.button("â Add Team", key="add_team_btn"):
+            if st.button("➕ Add Team", key="add_team_btn"):
                 if team_name and team_short and team_country:
                     success, message = create_team(team_name, team_short, team_country, team_captain, team_coach)
                     if success:
@@ -3246,7 +3855,7 @@ elif st.session_state.page == "enhanced_db":
                     else:
                         st.error(message)
                 else:
-                    st.warning("â ï¸ Please fill in Name, Short Name, and Country")
+                    st.warning("⚠️ Please fill in Name, Short Name, and Country")
 
         with team_col2:
             st.markdown("**All Teams**")
@@ -3272,7 +3881,7 @@ elif st.session_state.page == "enhanced_db":
             venue_capacity = st.number_input("Capacity", min_value=0, key="venue_capacity")
             venue_pitch = st.selectbox("Pitch Type", ["Grass", "Turf", "Artificial"], key="venue_pitch")
 
-            if st.button("â Add Venue", key="add_venue_btn"):
+            if st.button("➕ Add Venue", key="add_venue_btn"):
                 if venue_name and venue_city and venue_country:
                     success, message = create_venue(venue_name, venue_city, venue_country, venue_capacity, venue_pitch)
                     if success:
@@ -3281,7 +3890,7 @@ elif st.session_state.page == "enhanced_db":
                     else:
                         st.error(message)
                 else:
-                    st.warning("â ï¸ Please fill in Name, City, and Country")
+                    st.warning("⚠️ Please fill in Name, City, and Country")
 
         with venue_col2:
             st.markdown("**All Venues**")
@@ -3318,7 +3927,7 @@ elif st.session_state.page == "enhanced_db":
             player_dob = st.date_input("Date of Birth", key="player_dob")
             player_nationality = st.text_input("Nationality", key="player_nationality")
 
-            if st.button("â Add Player", key="add_player_btn"):
+            if st.button("➕ Add Player", key="add_player_btn"):
                 if player_name and player_team and player_role:
                     team_id = team_options[player_team]
                     success, message = create_player(
@@ -3332,7 +3941,7 @@ elif st.session_state.page == "enhanced_db":
                     else:
                         st.error(message)
                 else:
-                    st.warning("â ï¸ Please fill in Name, Team, and Role")
+                    st.warning("⚠️ Please fill in Name, Team, and Role")
 
         with player_col2:
             st.markdown("**All Players**")
@@ -3354,11 +3963,11 @@ elif st.session_state.page == "enhanced_db":
             st.markdown("**Add New Enhanced Match**")
 
             # Get series, teams, venues for dropdowns
-            success_series, series_list = read_all_teams()  # Placeholder - need to implement series CRUD
+            success_series, series_list = read_all_teams()
             success_teams, teams = read_all_teams()
             success_venues, venues = read_all_venues()
 
-            series_options = {f"Series {i+1}": i+1 for i in range(5)}  # Placeholder
+            series_options = {f"Series {i+1}": i+1 for i in range(5)}
             team_options = {f"{t['name']} (ID: {t['id']})": t['id'] for t in teams} if success_teams and teams else {}
             venue_options = {f"{v['name']} (ID: {v['id']})": v['id'] for v in venues} if success_venues and venues else {}
 
@@ -3370,7 +3979,7 @@ elif st.session_state.page == "enhanced_db":
             match_time = st.time_input("Match Time", key="match_time")
             match_status = st.text_input("Status", key="match_status")
 
-            if st.button("â Add Enhanced Match", key="add_enhanced_match_btn"):
+            if st.button("➕ Add Enhanced Match", key="add_enhanced_match_btn"):
                 if match_team1 and match_team2 and match_status:
                     series_id = series_options[match_series] if match_series else None
                     team1_id = team_options[match_team1]
@@ -3387,7 +3996,7 @@ elif st.session_state.page == "enhanced_db":
                     else:
                         st.error(message)
                 else:
-                    st.warning("â ï¸ Please fill in Team 1, Team 2, and Status")
+                    st.warning("⚠️ Please fill in Team 1, Team 2, and Status")
 
         with match_col2:
             st.markdown("**Enhanced Matches**")
@@ -3403,263 +4012,18 @@ elif st.session_state.page == "enhanced_db":
     with enhanced_tab5:
         st.subheader("Database Overview")
 
-        # Get stats for all tables
         try:
             conn = sqlite3.connect("cricket.db")
             cursor = conn.cursor()
 
             stats = {}
-
-            # Count records in each table
             tables = ['teams', 'venues', 'players', 'matches_enhanced', 'matches']
             for table in tables:
                 cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
                 stats[table] = cursor.fetchone()[0]
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.metric("Teams", stats.get('teams', 0))
-                st.metric("Venues", stats.get('venues', 0))
-                st.metric("Players", stats.get('players', 0))
-
-            with col2:
-                st.metric("Enhanced Matches", stats.get('matches_enhanced', 0))
-                st.metric("Legacy Matches", stats.get('matches', 0))
-
-            with col3:
-                total_records = sum(stats.values())
-                st.metric("Total Records", total_records)
-                st.metric("Database Tables", len(tables))
-
-            # Show table relationships
-            st.markdown("### Database Schema")
-            st.markdown("""
-            ```
-            teams (id, name, short_name, country, captain, coach)
-            âââ venues (id, name, city, country, capacity, pitch_type)
-            âââ players (id, name, full_name, team_idâteams.id, role, ...)
-            âââ matches_enhanced (id, series_id, team1_idâteams.id, team2_idâteams.id, venue_idâvenues.id, ...)
-                âââ scorecards (match_idâmatches_enhanced.id, team_idâteams.id, ...)
-                âââ player_performance (match_idâmatches_enhanced.id, player_idâplayers.id, ...)
-            ```
-            """)
-
-        except Exception as e:
-            st.error(f"Error loading database overview: {str(e)}")
-
-    st.button("â¬ Back", key="back_enhanced", on_click=navigate_page, args=("home",))
-
-# ================== ENHANCED DATABASE MANAGEMENT PAGE ==================
-elif st.session_state.page == "enhanced_db":
-
-    st.title("ðï¸ Enhanced Database Management")
-
-    st.markdown("""
-    ### Advanced Database Operations
-    Manage teams, venues, players, and enhanced match records with proper relationships.
-    """)
-
-    # Enhanced DB Tabs
-    enhanced_tab1, enhanced_tab2, enhanced_tab3, enhanced_tab4, enhanced_tab5 = st.tabs([
-        "ð Teams", "ðï¸ Venues", "ð¥ Players", "ð¯ Enhanced Matches", "ð Overview"
-    ])
-
-    # ==================== TEAMS TAB ====================
-    with enhanced_tab1:
-        st.subheader("Team Management")
-
-        team_col1, team_col2 = st.columns(2)
-
-        with team_col1:
-            st.markdown("**Add New Team**")
-            team_name = st.text_input("Team Name", key="team_name")
-            team_short = st.text_input("Short Name", key="team_short")
-            team_country = st.text_input("Country", key="team_country")
-            team_captain = st.text_input("Captain", key="team_captain")
-            team_coach = st.text_input("Coach", key="team_coach")
-
-            if st.button("â Add Team", key="add_team_btn"):
-                if team_name and team_short and team_country:
-                    success, message = create_team(team_name, team_short, team_country, team_captain, team_coach)
-                    if success:
-                        st.success(message)
-                        st.balloons()
-                    else:
-                        st.error(message)
-                else:
-                    st.warning("â ï¸ Please fill in Name, Short Name, and Country")
-
-        with team_col2:
-            st.markdown("**All Teams**")
-            success, teams = read_all_teams()
-            if success and teams:
-                df = pd.DataFrame(teams)
-                st.dataframe(df, use_container_width=True)
-                st.info(f"Total teams: {len(teams)}")
-            else:
-                st.warning("No teams found")
-
-    # ==================== VENUES TAB ====================
-    with enhanced_tab2:
-        st.subheader("Venue Management")
-
-        venue_col1, venue_col2 = st.columns(2)
-
-        with venue_col1:
-            st.markdown("**Add New Venue**")
-            venue_name = st.text_input("Venue Name", key="venue_name")
-            venue_city = st.text_input("City", key="venue_city")
-            venue_country = st.text_input("Country", key="venue_country")
-            venue_capacity = st.number_input("Capacity", min_value=0, key="venue_capacity")
-            venue_pitch = st.selectbox("Pitch Type", ["Grass", "Turf", "Artificial"], key="venue_pitch")
-
-            if st.button("â Add Venue", key="add_venue_btn"):
-                if venue_name and venue_city and venue_country:
-                    success, message = create_venue(venue_name, venue_city, venue_country, venue_capacity, venue_pitch)
-                    if success:
-                        st.success(message)
-                        st.balloons()
-                    else:
-                        st.error(message)
-                else:
-                    st.warning("â ï¸ Please fill in Name, City, and Country")
-
-        with venue_col2:
-            st.markdown("**All Venues**")
-            success, venues = read_all_venues()
-            if success and venues:
-                df = pd.DataFrame(venues)
-                st.dataframe(df, use_container_width=True)
-                st.info(f"Total venues: {len(venues)}")
-            else:
-                st.warning("No venues found")
-
-    # ==================== PLAYERS TAB ====================
-    with enhanced_tab3:
-        st.subheader("Player Management")
-
-        player_col1, player_col2 = st.columns(2)
-
-        with player_col1:
-            st.markdown("**Add New Player**")
-
-            # Get teams for dropdown
-            success, teams = read_all_teams()
-            team_options = {f"{t['name']} (ID: {t['id']})": t['id'] for t in teams} if success and teams else {}
-
-            player_name = st.text_input("Player Name", key="player_name")
-            player_full_name = st.text_input("Full Name", key="player_full_name")
-            player_team = st.selectbox("Team", list(team_options.keys()), key="player_team") if team_options else None
-            player_role = st.selectbox("Role", ["Batsman", "Bowler", "All-rounder", "Wicket-keeper"], key="player_role")
-            player_batting = st.selectbox("Batting Style", ["Right-handed", "Left-handed"], key="player_batting")
-            player_bowling = st.selectbox("Bowling Style",
-                ["Right-arm fast", "Left-arm fast", "Right-arm fast-medium", "Left-arm fast-medium",
-                 "Right-arm medium", "Left-arm medium", "Right-arm off-break", "Left-arm off-break",
-                 "Right-arm leg-break", "Left-arm leg-break", "None"], key="player_bowling")
-            player_dob = st.date_input("Date of Birth", key="player_dob")
-            player_nationality = st.text_input("Nationality", key="player_nationality")
-
-            if st.button("â Add Player", key="add_player_btn"):
-                if player_name and player_team and player_role:
-                    team_id = team_options[player_team]
-                    success, message = create_player(
-                        player_name, player_full_name, team_id, player_role,
-                        player_batting, player_bowling if player_bowling != "None" else None,
-                        str(player_dob), player_nationality
-                    )
-                    if success:
-                        st.success(message)
-                        st.balloons()
-                    else:
-                        st.error(message)
-                else:
-                    st.warning("â ï¸ Please fill in Name, Team, and Role")
-
-        with player_col2:
-            st.markdown("**All Players**")
-            success, players = read_all_players()
-            if success and players:
-                df = pd.DataFrame(players)
-                st.dataframe(df, use_container_width=True)
-                st.info(f"Total players: {len(players)}")
-            else:
-                st.warning("No players found")
-
-    # ==================== ENHANCED MATCHES TAB ====================
-    with enhanced_tab4:
-        st.subheader("Enhanced Match Management")
-
-        match_col1, match_col2 = st.columns(2)
-
-        with match_col1:
-            st.markdown("**Add New Enhanced Match**")
-
-            # Get series, teams, venues for dropdowns
-            success_series, series_list = read_all_teams()  # Placeholder - need to implement series CRUD
-            success_teams, teams = read_all_teams()
-            success_venues, venues = read_all_venues()
-
-            series_options = {f"Series {i+1}": i+1 for i in range(5)}  # Placeholder
-            team_options = {f"{t['name']} (ID: {t['id']})": t['id'] for t in teams} if success_teams and teams else {}
-            venue_options = {f"{v['name']} (ID: {v['id']})": v['id'] for v in venues} if success_venues and venues else {}
-
-            match_series = st.selectbox("Series", list(series_options.keys()), key="match_series") if series_options else None
-            match_team1 = st.selectbox("Team 1", list(team_options.keys()), key="match_team1") if team_options else None
-            match_team2 = st.selectbox("Team 2", list(team_options.keys()), key="match_team2") if team_options else None
-            match_venue = st.selectbox("Venue", list(venue_options.keys()), key="match_venue") if venue_options else None
-            match_date = st.date_input("Match Date", key="match_date")
-            match_time = st.time_input("Match Time", key="match_time")
-            match_status = st.text_input("Status", key="match_status")
-
-            if st.button("â Add Enhanced Match", key="add_enhanced_match_btn"):
-                if match_team1 and match_team2 and match_status:
-                    series_id = series_options[match_series] if match_series else None
-                    team1_id = team_options[match_team1]
-                    team2_id = team_options[match_team2]
-                    venue_id = venue_options[match_venue] if match_venue else None
-
-                    success, message = create_enhanced_match(
-                        series_id, team1_id, team2_id, venue_id,
-                        str(match_date), str(match_time), match_status
-                    )
-                    if success:
-                        st.success(message)
-                        st.balloons()
-                    else:
-                        st.error(message)
-                else:
-                    st.warning("â ï¸ Please fill in Team 1, Team 2, and Status")
-
-        with match_col2:
-            st.markdown("**Enhanced Matches**")
-            success, matches = read_all_enhanced_matches()
-            if success and matches:
-                df = pd.DataFrame(matches)
-                st.dataframe(df, use_container_width=True)
-                st.info(f"Total enhanced matches: {len(matches)}")
-            else:
-                st.warning("No enhanced matches found")
-
-    # ==================== OVERVIEW TAB ====================
-    with enhanced_tab5:
-        st.subheader("Database Overview")
-
-        # Get stats for all tables
-        try:
-            conn = sqlite3.connect("cricket.db")
-            cursor = conn.cursor()
-
-            stats = {}
-
-            # Count records in each table
-            tables = ['teams', 'venues', 'players', 'matches_enhanced', 'matches']
-            for table in tables:
-                cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
-                stats[table] = cursor.fetchone()['count']
 
             conn.close()
 
-            # Display stats
             col1, col2, col3 = st.columns(3)
 
             with col1:
@@ -3676,23 +4040,26 @@ elif st.session_state.page == "enhanced_db":
                 st.metric("Total Records", total_records)
                 st.metric("Database Tables", len(tables))
 
-            # Show table relationships
             st.markdown("### Database Schema")
             st.markdown("""
             ```
             teams (id, name, short_name, country, captain, coach)
-            âââ venues (id, name, city, country, capacity, pitch_type)
-            âââ players (id, name, full_name, team_idâteams.id, role, ...)
-            âââ matches_enhanced (id, series_id, team1_idâteams.id, team2_idâteams.id, venue_idâvenues.id, ...)
-                âââ scorecards (match_idâmatches_enhanced.id, team_idâteams.id, ...)
-                âââ player_performance (match_idâmatches_enhanced.id, player_idâplayers.id, ...)
+            ├── venues (id, name, city, country, capacity, pitch_type)
+            ├── players (id, name, full_name, team_id→teams.id, role, ...)
+            └── matches_enhanced (id, series_id, team1_id→teams.id, team2_id→teams.id, venue_id→venues.id, ...)
+                ├── scorecards (match_id→matches_enhanced.id, team_id→teams.id, ...)
+                └── player_performance (match_id→matches_enhanced.id, player_id→players.id, ...)
             ```
             """)
 
         except Exception as e:
             st.error(f"Error loading database overview: {str(e)}")
 
-    st.button("â¬ Back", key="back_enhanced", on_click=navigate_page, args=("home",))
+    col_eb1, col_eb2 = st.columns([1, 1])
+    with col_eb1:
+        st.button("⬅ Back to Home", key="back_enhanced", on_click=navigate_page, args=("home",))
+    with col_eb2:
+        st.button("⚙️ Go to Match CRUD Manager ➔", key="btn_enhanced_to_crud", on_click=navigate_page, args=("crud",))
 
 
 # ================== DATA VISUALIZATIONS PAGE ==================
